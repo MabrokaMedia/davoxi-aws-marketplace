@@ -6,7 +6,8 @@ import { Request, Response, NextFunction } from "express";
  */
 export function internalSecretAuth(req: Request, res: Response, next: NextFunction): void {
   const secret = process.env.INTERNAL_METERING_SECRET;
-  const provided = req.headers["x-internal-secret"];
+  const raw = req.headers["x-internal-secret"];
+  const provided = Array.isArray(raw) ? raw[0] : raw;
 
   if (!secret || !provided || provided !== secret) {
     res.status(401).json({ error: "Unauthorized" });
@@ -22,7 +23,8 @@ export function internalSecretAuth(req: Request, res: Response, next: NextFuncti
  */
 export function adminSecretAuth(req: Request, res: Response, next: NextFunction): void {
   const secret = process.env.ADMIN_SECRET;
-  const provided = req.headers["x-admin-secret"];
+  const raw = req.headers["x-admin-secret"];
+  const provided = Array.isArray(raw) ? raw[0] : raw;
 
   if (!secret || !provided || provided !== secret) {
     res.status(401).json({ error: "Unauthorized" });
