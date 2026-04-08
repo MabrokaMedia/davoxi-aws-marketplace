@@ -80,7 +80,7 @@ router.post("/report", internalSecretAuth, async (_req, res) => {
  * GET /metering/entitlements/:customerId — Check customer entitlements (contract model).
  */
 router.get("/entitlements/:customerId", internalSecretAuth, async (req, res) => {
-  const { customerId } = req.params;
+  const customerId = String(req.params.customerId);
 
   const customer = getCustomer(customerId);
   if (!customer) {
