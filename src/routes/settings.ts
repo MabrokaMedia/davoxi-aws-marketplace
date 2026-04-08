@@ -1,12 +1,13 @@
 import { Router } from "express";
 import { getCustomer, setDavoxiApiKey } from "../services/customer-store";
+import { adminSecretAuth } from "../middleware/auth";
 
 const router = Router();
 
 /**
  * POST /settings/api-key — Link a Davoxi API key to an AWS Marketplace customer.
  */
-router.post("/api-key", async (req, res) => {
+router.post("/api-key", adminSecretAuth, async (req, res) => {
   const { customerId, apiKey } = req.body as { customerId?: string; apiKey?: string };
 
   if (!customerId || !apiKey) {

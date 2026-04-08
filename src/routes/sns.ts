@@ -3,6 +3,17 @@ import { deactivateCustomer, getCustomer } from "../services/customer-store";
 
 const router = Router();
 
+/**
+ * Validate that the SNS SubscribeURL hostname is a legitimate amazonaws.com endpoint.
+ * Prevents SSRF by rejecting non-AWS URLs.
+ *
+ * TODO: For full security, add cryptographic SNS message signature verification
+ * using the sns-validator npm package once it is available in this project.
+ */
+export function validateSnsSignatureUrl(url: string): boolean {
+  return /^https:\/\/sns\.[a-z0-9-]+\.amazonaws\.com\//.test(url);
+}
+
 interface SNSMessage {
   Type: string;
   TopicArn?: string;
@@ -29,6 +40,10 @@ router.post("/", async (req, res) => {
 
   // Handle SNS subscription confirmation
   if (snsMessage.Type === "SubscriptionConfirmation" && snsMessage.SubscribeURL) {
+    if (!validateSnsSignatureUrl(snsMessage.SubscribeURL)) {
+      res.status(403).json({ error: "Invalid SubscribeURL" });
+      return;
+    }
     try {
       await fetch(snsMessage.SubscribeURL);
       console.log("SNS subscription confirmed");

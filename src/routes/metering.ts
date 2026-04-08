@@ -2,6 +2,7 @@ import { Router } from "express";
 import { meterAllCustomers } from "../services/metering";
 import { getEntitlements } from "../services/entitlements";
 import { getCustomer } from "../services/customer-store";
+import { internalSecretAuth } from "../middleware/auth";
 
 const router = Router();
 
@@ -12,7 +13,7 @@ const router = Router();
  * every hour. The handler fetches each customer's Davoxi usage and reports it
  * to AWS Marketplace Metering Service.
  */
-router.post("/report", async (_req, res) => {
+router.post("/report", internalSecretAuth, async (_req, res) => {
   try {
     const results = await meterAllCustomers(async (davoxiApiKey) => {
       // Fetch usage from Davoxi API
@@ -70,15 +71,15 @@ router.post("/report", async (_req, res) => {
 
     res.json({ success: true, results });
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    res.status(500).json({ error: "Metering report failed", details: message });
+    console.error("Metering report error:", err);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
 /**
  * GET /metering/entitlements/:customerId — Check customer entitlements (contract model).
  */
-router.get("/entitlements/:customerId", async (req, res) => {
+router.get("/entitlements/:customerId", internalSecretAuth, async (req, res) => {
   const { customerId } = req.params;
 
   const customer = getCustomer(customerId);
@@ -91,8 +92,8 @@ router.get("/entitlements/:customerId", async (req, res) => {
     const entitlements = await getEntitlements(customerId);
     res.json({ customerId, entitlements });
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    res.status(500).json({ error: "Failed to fetch entitlements", details: message });
+    console.error("Entitlements fetch error:", err);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
