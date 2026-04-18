@@ -1,5 +1,7 @@
 "use strict";
 
+const crypto = require("crypto");
+
 /**
  * Unit tests for auth middleware and SNS URL validation logic.
  *
@@ -10,13 +12,21 @@
 // ---------------------------------------------------------------------------
 // Inline the pure logic under test (mirrors src/middleware/auth.ts and
 // src/routes/sns.ts) so tests run without a build step.
+// safeCompare mirrors the implementation in src/middleware/auth.ts.
 // ---------------------------------------------------------------------------
+
+function safeCompare(a, b) {
+  const aBuf = Buffer.from(a);
+  const bBuf = Buffer.from(b);
+  if (aBuf.length !== bBuf.length) return false;
+  return crypto.timingSafeEqual(aBuf, bBuf);
+}
 
 function makeInternalSecretAuth(envSecret) {
   return function internalSecretAuth(req, res, next) {
     const secret = envSecret;
     const provided = req.headers["x-internal-secret"];
-    if (!secret || !provided || provided !== secret) {
+    if (!secret || !provided || !safeCompare(provided, secret)) {
       res.status(401).json({ error: "Unauthorized" });
       return;
     }
@@ -28,7 +38,7 @@ function makeAdminSecretAuth(envSecret) {
   return function adminSecretAuth(req, res, next) {
     const secret = envSecret;
     const provided = req.headers["x-admin-secret"];
-    if (!secret || !provided || provided !== secret) {
+    if (!secret || !provided || !safeCompare(provided, secret)) {
       res.status(401).json({ error: "Unauthorized" });
       return;
     }
@@ -114,6 +124,28 @@ describe("internalSecretAuth", () => {
     expect(res._status).toBe(401);
     expect(next).not.toHaveBeenCalled();
   });
+
+  test("rejects a prefix of the secret (length-mismatch timing-safe check)", () => {
+    const req = { headers: { "x-internal-secret": SECRET.slice(0, -1) } };
+    const res = mockRes();
+    const next = jest.fn();
+
+    middleware(req, res, next);
+
+    expect(res._status).toBe(401);
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  test("rejects a secret extended by one character (length-mismatch timing-safe check)", () => {
+    const req = { headers: { "x-internal-secret": SECRET + "X" } };
+    const res = mockRes();
+    const next = jest.fn();
+
+    middleware(req, res, next);
+
+    expect(res._status).toBe(401);
+    expect(next).not.toHaveBeenCalled();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -156,6 +188,28 @@ describe("adminSecretAuth", () => {
 
     expect(res._status).toBeNull();
     expect(next).toHaveBeenCalledTimes(1);
+  });
+
+  test("rejects a prefix of the admin secret (length-mismatch timing-safe check)", () => {
+    const req = { headers: { "x-admin-secret": SECRET.slice(0, -1) } };
+    const res = mockRes();
+    const next = jest.fn();
+
+    middleware(req, res, next);
+
+    expect(res._status).toBe(401);
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  test("rejects admin secret extended by one character (length-mismatch timing-safe check)", () => {
+    const req = { headers: { "x-admin-secret": SECRET + "Y" } };
+    const res = mockRes();
+    const next = jest.fn();
+
+    middleware(req, res, next);
+
+    expect(res._status).toBe(401);
+    expect(next).not.toHaveBeenCalled();
   });
 });
 

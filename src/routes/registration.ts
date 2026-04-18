@@ -40,7 +40,8 @@ router.post("/", async (req, res) => {
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error("Registration failed:", message);
-    res.status(500).json({ error: "Registration failed", details: message });
+    // Do not surface internal AWS SDK error details to the caller
+    res.status(500).json({ error: "Registration failed" });
   }
 });
 
