@@ -73,7 +73,7 @@ function buildStringToSign(message: SNSMessage): string {
 
   let str = "";
   for (const key of keys) {
-    const value = (message as Record<string, string | undefined>)[key];
+    const value = (message as unknown as Record<string, string | undefined>)[key];
     if (value !== undefined && value !== null) {
       str += `${key}\n${value}\n`;
     }
