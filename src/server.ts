@@ -28,7 +28,9 @@ const RATE_LIMIT_MAX = 100;
 const RATE_LIMIT_WINDOW_MS = 60_000;
 
 export function ipRateLimit(req: Request, res: Response, next: NextFunction): void {
-  const ip = (req.headers["x-forwarded-for"] as string | undefined)?.split(",")[0]?.trim() ?? req.socket.remoteAddress ?? "unknown";
+  // Use the rightmost (last) X-Forwarded-For entry: AWS ALB appends the real client IP there.
+  // The first entry is client-controlled and can be spoofed to bypass rate limiting.
+  const ip = (req.headers["x-forwarded-for"] as string | undefined)?.split(",").at(-1)?.trim() ?? req.socket.remoteAddress ?? "unknown";
   const now = Date.now();
 
   let entry = rateLimitStore.get(ip);

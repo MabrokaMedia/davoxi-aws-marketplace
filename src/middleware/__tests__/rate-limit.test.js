@@ -14,9 +14,11 @@ const RATE_LIMIT_WINDOW_MS = 60_000;
 
 function makeIpRateLimit(store, nowFn) {
   return function ipRateLimit(req, res, next) {
+    // Use last X-Forwarded-For entry: AWS ALB appends the real client IP there.
+    // The first entry is client-controlled and can be spoofed.
     const ip =
       (req.headers && typeof req.headers["x-forwarded-for"] === "string"
-        ? req.headers["x-forwarded-for"].split(",")[0].trim()
+        ? req.headers["x-forwarded-for"].split(",").at(-1).trim()
         : null) ??
       (req.socket && req.socket.remoteAddress) ??
       "unknown";
@@ -170,21 +172,46 @@ describe("ipRateLimit", () => {
     expect(res._status).toBeNull();
   });
 
-  test("uses X-Forwarded-For header for IP when present", () => {
+  test("uses the LAST X-Forwarded-For entry (set by ALB, not client-spoofable)", () => {
     const store = new Map();
     let now = 1000;
     const middleware = makeIpRateLimit(store, () => now);
     const next = jest.fn();
 
-    // Use the forwarded IP, not socket.remoteAddress
+    // Client sends X-Forwarded-For: spoofed-ip; ALB appends real IP at end
     const req = makeReq("127.0.0.1", "203.0.113.42, 10.0.0.1");
     const res = mockRes();
     middleware(req, res, next);
 
     expect(next).toHaveBeenCalledTimes(1);
-    // The store entry should be keyed on the first forwarded IP
-    expect(store.has("203.0.113.42")).toBe(true);
+    // Rate limiter must key on the LAST entry (ALB-appended real IP), not the first (spoofable)
+    expect(store.has("10.0.0.1")).toBe(true);
+    expect(store.has("203.0.113.42")).toBe(false);
     expect(store.has("127.0.0.1")).toBe(false);
+  });
+
+  test("spoofed X-Forwarded-For prefix cannot bypass rate limit (last entry is authoritative)", () => {
+    const store = new Map();
+    let now = 1000;
+    const middleware = makeIpRateLimit(store, () => now);
+    const next = jest.fn();
+
+    // Exhaust limit for the real IP (last entry)
+    const realIp = "198.51.100.7";
+    for (let i = 0; i < 100; i++) {
+      // Attacker rotates the first entry but the last (real) IP stays the same
+      const req = makeReq("127.0.0.1", `fake-ip-${i}, ${realIp}`);
+      middleware(req, mockRes(), next);
+    }
+    expect(next).toHaveBeenCalledTimes(100);
+
+    // 101st request — different spoofed prefix, same real IP — must be rejected
+    const req101 = makeReq("127.0.0.1", `another-fake-ip, ${realIp}`);
+    const res = mockRes();
+    middleware(req101, res, next);
+
+    expect(res._status).toBe(429);
+    expect(next).toHaveBeenCalledTimes(100);
   });
 
   test("sets Retry-After header on 429 response", () => {
