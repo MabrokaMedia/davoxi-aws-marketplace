@@ -96,8 +96,14 @@ export async function verifySnsSignature(message: SNSMessage): Promise<boolean> 
     return false;
   }
 
-  if (message.SignatureVersion !== "1") {
-    // Only SignatureVersion 1 (SHA1withRSA) is currently supported
+  // AWS SNS uses Version 1 (SHA1withRSA) historically; Version 2 (SHA256withRSA) was
+  // added in 2022 and is the recommended default. Accept both.
+  let algorithm: string;
+  if (message.SignatureVersion === "1") {
+    algorithm = "SHA1";
+  } else if (message.SignatureVersion === "2") {
+    algorithm = "SHA256";
+  } else {
     return false;
   }
 
@@ -111,7 +117,7 @@ export async function verifySnsSignature(message: SNSMessage): Promise<boolean> 
   const stringToSign = buildStringToSign(message);
 
   try {
-    const verifier = crypto.createVerify("SHA1");
+    const verifier = crypto.createVerify(algorithm);
     verifier.update(stringToSign, "utf8");
     return verifier.verify(pem, message.Signature, "base64");
   } catch {

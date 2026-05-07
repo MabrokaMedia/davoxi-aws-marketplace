@@ -26,6 +26,39 @@ interface RateLimitEntry {
 const rateLimitStore = new Map<string, RateLimitEntry>();
 const RATE_LIMIT_MAX = 100;
 const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_GC_INTERVAL_MS = 5 * 60_000;
+const RATE_LIMIT_MAX_ENTRIES = 100_000;
+
+/**
+ * Sweep expired entries so the store doesn't grow unbounded across the process lifetime.
+ * Exported for unit-testing purposes.
+ */
+export function gcRateLimitStore(now: number = Date.now()): number {
+  let removed = 0;
+  for (const [ip, entry] of rateLimitStore) {
+    if (now >= entry.reset) {
+      rateLimitStore.delete(ip);
+      removed += 1;
+    }
+  }
+  // Hard cap as a safety valve in case the IP space genuinely exceeds the cap inside one window.
+  if (rateLimitStore.size > RATE_LIMIT_MAX_ENTRIES) {
+    const overflow = rateLimitStore.size - RATE_LIMIT_MAX_ENTRIES;
+    let i = 0;
+    for (const ip of rateLimitStore.keys()) {
+      if (i >= overflow) break;
+      rateLimitStore.delete(ip);
+      removed += 1;
+      i += 1;
+    }
+  }
+  return removed;
+}
+
+const rateLimitGc = setInterval(() => {
+  gcRateLimitStore();
+}, RATE_LIMIT_GC_INTERVAL_MS);
+rateLimitGc.unref?.();
 
 export function ipRateLimit(req: Request, res: Response, next: NextFunction): void {
   // Use the rightmost (last) X-Forwarded-For entry: AWS ALB appends the real client IP there.
@@ -65,8 +98,10 @@ app.use("/settings", settingsRoutes);
 app.use("/metering", meteringRoutes);
 app.use("/sns", snsRoutes);
 
-app.listen(config.port, () => {
-  console.log(`Davoxi AWS Marketplace integration running on port ${config.port}`);
-});
+if (require.main === module) {
+  app.listen(config.port, () => {
+    console.log(`Davoxi AWS Marketplace integration running on port ${config.port}`);
+  });
+}
 
 export default app;

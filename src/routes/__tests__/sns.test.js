@@ -44,7 +44,12 @@ async function verifySnsSignature(message, fetchImpl) {
   if (!message.Signature || !message.SigningCertURL) {
     return false;
   }
-  if (message.SignatureVersion !== "1") {
+  let algorithm;
+  if (message.SignatureVersion === "1") {
+    algorithm = "SHA1";
+  } else if (message.SignatureVersion === "2") {
+    algorithm = "SHA256";
+  } else {
     return false;
   }
   if (!validateSigningCertUrl(message.SigningCertURL)) {
@@ -61,12 +66,19 @@ async function verifySnsSignature(message, fetchImpl) {
 
   const stringToSign = buildStringToSign(message);
   try {
-    const verifier = crypto.createVerify("SHA1");
+    const verifier = crypto.createVerify(algorithm);
     verifier.update(stringToSign, "utf8");
     return verifier.verify(pem, message.Signature, "base64");
   } catch {
     return false;
   }
+}
+
+function signMessageSha256(message, privateKeyPem) {
+  const stringToSign = buildStringToSign(message);
+  const signer = crypto.createSign("SHA256");
+  signer.update(stringToSign, "utf8");
+  return signer.sign(privateKeyPem, "base64");
 }
 
 // ---------------------------------------------------------------------------
@@ -184,18 +196,50 @@ describe("verifySnsSignature", () => {
     expect(result).toBe(false);
   });
 
-  test("returns false for unsupported SignatureVersion", async () => {
+  test("returns false for unsupported SignatureVersion (e.g. v3)", async () => {
     const message = {
       Type: "Notification",
       MessageId: "msg-001",
       TopicArn: "arn:aws:sns:us-east-1:123456789012:test",
       Message: "hello",
       Timestamp: "2024-01-01T00:00:00.000Z",
-      SignatureVersion: "2",
+      SignatureVersion: "3",
       Signature: "dGVzdA==",
       SigningCertURL: "https://sns.us-east-1.amazonaws.com/cert.pem",
     };
     const result = await verifySnsSignature(message, jest.fn());
+    expect(result).toBe(false);
+  });
+
+  test("returns true for a valid SignatureVersion 2 (SHA256withRSA) signature", async () => {
+    const { publicKey, privateKey } = getTestKeyPair();
+    const message = {
+      Type: "Notification",
+      MessageId: "msg-v2",
+      TopicArn: "arn:aws:sns:us-east-1:123456789012:test",
+      Message: "hello-v2",
+      Timestamp: "2026-05-07T00:00:00.000Z",
+      SignatureVersion: "2",
+      SigningCertURL: "https://sns.us-east-1.amazonaws.com/cert.pem",
+    };
+    message.Signature = signMessageSha256(message, privateKey);
+    const result = await verifySnsSignature(message, makeFetchReturningCert(publicKey));
+    expect(result).toBe(true);
+  });
+
+  test("returns false when v2 signature was actually signed with SHA1 (downgrade attempt)", async () => {
+    const { publicKey, privateKey } = getTestKeyPair();
+    const message = {
+      Type: "Notification",
+      MessageId: "msg-mixed",
+      TopicArn: "arn:aws:sns:us-east-1:123456789012:test",
+      Message: "hello",
+      Timestamp: "2026-05-07T00:00:00.000Z",
+      SignatureVersion: "2",
+      SigningCertURL: "https://sns.us-east-1.amazonaws.com/cert.pem",
+    };
+    message.Signature = signMessage(message, privateKey); // signed with SHA1
+    const result = await verifySnsSignature(message, makeFetchReturningCert(publicKey));
     expect(result).toBe(false);
   });
 
