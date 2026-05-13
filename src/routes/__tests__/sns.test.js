@@ -14,12 +14,49 @@ const crypto = require("crypto");
 // Inline the pure logic from src/routes/sns.ts
 // ---------------------------------------------------------------------------
 
+const SNS_HOSTNAME_RE = /^sns\.[a-z0-9-]+\.amazonaws\.com$/;
+const SNS_TIMESTAMP_MAX_SKEW_MS = 60 * 60 * 1000;
+
+function isStrictSnsUrl(url) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== "https:") return false;
+  if (parsed.username !== "" || parsed.password !== "") return false;
+  return SNS_HOSTNAME_RE.test(parsed.hostname);
+}
+
 function validateSnsSignatureUrl(url) {
-  return /^https:\/\/sns\.[a-z0-9-]+\.amazonaws\.com\//.test(url);
+  return isStrictSnsUrl(url);
 }
 
 function validateSigningCertUrl(url) {
-  return /^https:\/\/sns\.[a-z0-9-]+\.amazonaws\.com\//.test(url);
+  return isStrictSnsUrl(url);
+}
+
+function isSnsTimestampFresh(timestamp, nowMs) {
+  if (nowMs === undefined) nowMs = Date.now();
+  if (!timestamp) return false;
+  const t = Date.parse(timestamp);
+  if (Number.isNaN(t)) return false;
+  const delta = nowMs - t;
+  if (delta > SNS_TIMESTAMP_MAX_SKEW_MS) return false;
+  if (delta < -5 * 60 * 1000) return false;
+  return true;
+}
+
+function isExpectedTopicArn(topicArn) {
+  const expected = process.env.EXPECTED_SNS_TOPIC_ARN;
+  if (!expected) {
+    if (process.env.NODE_ENV === "production") return false;
+    if (!topicArn) return false;
+    return true;
+  }
+  if (!topicArn) return false;
+  return topicArn === expected;
 }
 
 function buildStringToSign(message) {
@@ -44,7 +81,12 @@ async function verifySnsSignature(message, fetchImpl) {
   if (!message.Signature || !message.SigningCertURL) {
     return false;
   }
-  if (message.SignatureVersion !== "1") {
+  let algorithm;
+  if (message.SignatureVersion === "1") {
+    algorithm = "SHA1";
+  } else if (message.SignatureVersion === "2") {
+    algorithm = "SHA256";
+  } else {
     return false;
   }
   if (!validateSigningCertUrl(message.SigningCertURL)) {
@@ -61,12 +103,19 @@ async function verifySnsSignature(message, fetchImpl) {
 
   const stringToSign = buildStringToSign(message);
   try {
-    const verifier = crypto.createVerify("SHA1");
+    const verifier = crypto.createVerify(algorithm);
     verifier.update(stringToSign, "utf8");
     return verifier.verify(pem, message.Signature, "base64");
   } catch {
     return false;
   }
+}
+
+function signMessageSha256(message, privateKeyPem) {
+  const stringToSign = buildStringToSign(message);
+  const signer = crypto.createSign("SHA256");
+  signer.update(stringToSign, "utf8");
+  return signer.sign(privateKeyPem, "base64");
 }
 
 // ---------------------------------------------------------------------------
@@ -129,6 +178,24 @@ describe("validateSnsSignatureUrl", () => {
   test("rejects empty string", () => {
     expect(validateSnsSignatureUrl("")).toBe(false);
   });
+
+  test("rejects URL using userinfo to spoof the host", () => {
+    // Regex pre-2026-05-13 fix matched the raw string; parsing routes the
+    // request to evil.com. Both must be rejected.
+    expect(validateSnsSignatureUrl("https://sns.us-east-1.amazonaws.com@evil.com/")).toBe(false);
+    expect(validateSnsSignatureUrl("https://user:pass@sns.us-east-1.amazonaws.com/")).toBe(false);
+  });
+
+  test("rejects malformed URLs", () => {
+    expect(validateSnsSignatureUrl("not-a-url")).toBe(false);
+    expect(validateSnsSignatureUrl("javascript:alert(1)")).toBe(false);
+  });
+
+  test("rejects URL whose hostname only superficially looks like SNS", () => {
+    // The hostname-anchored regex must not match e.g. snsXus-east-1.amazonaws.com
+    expect(validateSnsSignatureUrl("https://sns-us-east-1.amazonaws.com/")).toBe(false);
+    expect(validateSnsSignatureUrl("https://sns.amazonaws.com/")).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -184,18 +251,50 @@ describe("verifySnsSignature", () => {
     expect(result).toBe(false);
   });
 
-  test("returns false for unsupported SignatureVersion", async () => {
+  test("returns false for unsupported SignatureVersion (e.g. v3)", async () => {
     const message = {
       Type: "Notification",
       MessageId: "msg-001",
       TopicArn: "arn:aws:sns:us-east-1:123456789012:test",
       Message: "hello",
       Timestamp: "2024-01-01T00:00:00.000Z",
-      SignatureVersion: "2",
+      SignatureVersion: "3",
       Signature: "dGVzdA==",
       SigningCertURL: "https://sns.us-east-1.amazonaws.com/cert.pem",
     };
     const result = await verifySnsSignature(message, jest.fn());
+    expect(result).toBe(false);
+  });
+
+  test("returns true for a valid SignatureVersion 2 (SHA256withRSA) signature", async () => {
+    const { publicKey, privateKey } = getTestKeyPair();
+    const message = {
+      Type: "Notification",
+      MessageId: "msg-v2",
+      TopicArn: "arn:aws:sns:us-east-1:123456789012:test",
+      Message: "hello-v2",
+      Timestamp: "2026-05-07T00:00:00.000Z",
+      SignatureVersion: "2",
+      SigningCertURL: "https://sns.us-east-1.amazonaws.com/cert.pem",
+    };
+    message.Signature = signMessageSha256(message, privateKey);
+    const result = await verifySnsSignature(message, makeFetchReturningCert(publicKey));
+    expect(result).toBe(true);
+  });
+
+  test("returns false when v2 signature was actually signed with SHA1 (downgrade attempt)", async () => {
+    const { publicKey, privateKey } = getTestKeyPair();
+    const message = {
+      Type: "Notification",
+      MessageId: "msg-mixed",
+      TopicArn: "arn:aws:sns:us-east-1:123456789012:test",
+      Message: "hello",
+      Timestamp: "2026-05-07T00:00:00.000Z",
+      SignatureVersion: "2",
+      SigningCertURL: "https://sns.us-east-1.amazonaws.com/cert.pem",
+    };
+    message.Signature = signMessage(message, privateKey); // signed with SHA1
+    const result = await verifySnsSignature(message, makeFetchReturningCert(publicKey));
     expect(result).toBe(false);
   });
 
@@ -335,5 +434,102 @@ describe("verifySnsSignature", () => {
     const mockFetch = makeFetchReturningCert(publicKey);
     const result = await verifySnsSignature(tampered, mockFetch);
     expect(result).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests: isSnsTimestampFresh — replay protection
+// ---------------------------------------------------------------------------
+
+describe("isSnsTimestampFresh", () => {
+  const NOW = Date.parse("2026-05-13T12:00:00.000Z");
+
+  test("accepts a timestamp from a few minutes ago", () => {
+    const t = new Date(NOW - 5 * 60 * 1000).toISOString();
+    expect(isSnsTimestampFresh(t, NOW)).toBe(true);
+  });
+
+  test("accepts a timestamp at the boundary (~59 minutes old)", () => {
+    const t = new Date(NOW - 59 * 60 * 1000).toISOString();
+    expect(isSnsTimestampFresh(t, NOW)).toBe(true);
+  });
+
+  test("rejects a timestamp older than 1 hour (replay)", () => {
+    const t = new Date(NOW - 61 * 60 * 1000).toISOString();
+    expect(isSnsTimestampFresh(t, NOW)).toBe(false);
+  });
+
+  test("rejects a timestamp far in the future (>5 min skew)", () => {
+    const t = new Date(NOW + 10 * 60 * 1000).toISOString();
+    expect(isSnsTimestampFresh(t, NOW)).toBe(false);
+  });
+
+  test("accepts a timestamp slightly in the future (within clock skew)", () => {
+    const t = new Date(NOW + 2 * 60 * 1000).toISOString();
+    expect(isSnsTimestampFresh(t, NOW)).toBe(true);
+  });
+
+  test("rejects missing timestamp", () => {
+    expect(isSnsTimestampFresh(undefined, NOW)).toBe(false);
+    expect(isSnsTimestampFresh("", NOW)).toBe(false);
+  });
+
+  test("rejects an unparseable timestamp", () => {
+    expect(isSnsTimestampFresh("not-a-date", NOW)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests: isExpectedTopicArn — pin against cross-tenant SNS confusion
+// ---------------------------------------------------------------------------
+
+describe("isExpectedTopicArn", () => {
+  const ORIGINAL_EXPECTED = process.env.EXPECTED_SNS_TOPIC_ARN;
+  const ORIGINAL_NODE_ENV = process.env.NODE_ENV;
+
+  afterEach(() => {
+    if (ORIGINAL_EXPECTED === undefined) {
+      delete process.env.EXPECTED_SNS_TOPIC_ARN;
+    } else {
+      process.env.EXPECTED_SNS_TOPIC_ARN = ORIGINAL_EXPECTED;
+    }
+    if (ORIGINAL_NODE_ENV === undefined) {
+      delete process.env.NODE_ENV;
+    } else {
+      process.env.NODE_ENV = ORIGINAL_NODE_ENV;
+    }
+  });
+
+  test("accepts TopicArn when it matches EXPECTED_SNS_TOPIC_ARN exactly", () => {
+    process.env.EXPECTED_SNS_TOPIC_ARN = "arn:aws:sns:us-east-1:111111111111:marketplace";
+    expect(isExpectedTopicArn("arn:aws:sns:us-east-1:111111111111:marketplace")).toBe(true);
+  });
+
+  test("rejects TopicArn from a different AWS account (cross-tenant attack)", () => {
+    process.env.EXPECTED_SNS_TOPIC_ARN = "arn:aws:sns:us-east-1:111111111111:marketplace";
+    expect(isExpectedTopicArn("arn:aws:sns:us-east-1:999999999999:marketplace")).toBe(false);
+  });
+
+  test("rejects TopicArn that differs only by topic name", () => {
+    process.env.EXPECTED_SNS_TOPIC_ARN = "arn:aws:sns:us-east-1:111111111111:marketplace";
+    expect(isExpectedTopicArn("arn:aws:sns:us-east-1:111111111111:other-topic")).toBe(false);
+  });
+
+  test("rejects missing TopicArn", () => {
+    process.env.EXPECTED_SNS_TOPIC_ARN = "arn:aws:sns:us-east-1:111111111111:marketplace";
+    expect(isExpectedTopicArn(undefined)).toBe(false);
+    expect(isExpectedTopicArn("")).toBe(false);
+  });
+
+  test("fails closed in production when EXPECTED_SNS_TOPIC_ARN is unset", () => {
+    delete process.env.EXPECTED_SNS_TOPIC_ARN;
+    process.env.NODE_ENV = "production";
+    expect(isExpectedTopicArn("arn:aws:sns:us-east-1:111111111111:marketplace")).toBe(false);
+  });
+
+  test("allows any TopicArn in non-production when env is unset (dev convenience)", () => {
+    delete process.env.EXPECTED_SNS_TOPIC_ARN;
+    process.env.NODE_ENV = "development";
+    expect(isExpectedTopicArn("arn:aws:sns:us-east-1:111111111111:marketplace")).toBe(true);
   });
 });
